@@ -5,7 +5,8 @@ import time
 from typing import Any, Dict, Optional
 
 import requests
-
+from dotenv import load_dotenv
+load_dotenv()
 
 class RecallClient:
     def __init__(self) -> None:

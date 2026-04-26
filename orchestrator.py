@@ -102,9 +102,10 @@ class Orchestrator:
             len(issues),
         )
 
-        greeting = (
-            "Good day team. We will begin shortly. "
-            "Please wait while the screen sharing dashboard loads."
+        greeting = self.agent.create_support_greeting(
+            team_name=os.getenv("STANDUP_TEAM_NAME"),
+            include_dashboard_notice=bool(self.dashboard_url),
+            include_mute_reminder=False,
         )
         logger.info("Sending standup greeting before issue review: instance_id=%s", instance_id)
         state["status"] = "initializing"
@@ -402,11 +403,11 @@ class Orchestrator:
         if not issue_key:
             return ""
         if already_in_target and new_status:
-            return f"{issue_key} is already in {new_status}."
+            return f"{issue_key} remains in {new_status}. Moving on to next jira."
         if old_status and new_status and old_status.lower() != new_status.lower():
-            return f"Got it. Moving {issue_key} from {old_status} to {new_status}."
+            return f"Got it. Moving {issue_key} from {old_status} to {new_status}. Moving on to next jira."
         if new_status:
-            return f"Got it. Updating {issue_key} to {new_status}."
+            return f"Got it. Updating {issue_key} to {new_status}. Moving on to next jira."
         return ""
 
     def _maybe_update_issue_status(self, current_issue: Dict[str, Any], text: str, intent: str) -> Optional[Dict[str, Any]]:

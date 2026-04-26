@@ -5,7 +5,8 @@ import re
 from typing import Any, Dict, List, Optional
 
 import requests
-
+from dotenv import load_dotenv
+load_dotenv()
 
 class AgentClient:
     def __init__(self) -> None:
@@ -15,6 +16,7 @@ class AgentClient:
         self.foundry_token = os.getenv("FOUNDRY_AGENT_TOKEN", "")
         self.default_project_key = os.getenv("JIRA_PROJECT_KEY", "KAN")
         self.max_issues = int(os.getenv("STANDUP_MAX_ISSUES", "25"))
+
 
     def get_active_issues(self, project_key: str | None = None) -> List[Dict[str, Any]]:
         project_key = project_key or self.default_project_key
@@ -47,6 +49,45 @@ class AgentClient:
         logging.info("Agent returned %s project issues for dashboard and standup queueing", len(issues))
         return issues
 
+    def create_support_greeting(
+        self,
+        team_name: str | None = None,
+        include_dashboard_notice: bool = True,
+        include_mute_reminder: bool = False,
+    ) -> str:
+        team = team_name or "team"
+
+        if not self._is_foundry_configured():
+            parts = [f"Good day {team}. We will begin shortly."]
+            if include_dashboard_notice:
+                parts.append("Please wait while the screen sharing dashboard loads.")
+            if include_mute_reminder:
+                parts.append("Please keep yourselves muted until called upon.")
+            return " ".join(parts)
+
+        context_parts = [f"The standup is for the {team}."]
+        if include_dashboard_notice:
+            context_parts.append("A screen sharing dashboard will be displayed.")
+        if include_mute_reminder:
+            context_parts.append("Participants should stay muted until called upon.")
+
+        prompt = (
+            "Generate a short, professional standup meeting greeting to be spoken aloud by a bot. "
+            "Return only the plain speech text with no JSON, markdown, or formatting. "
+            "It should welcome the team, signal the standup is starting, and set expectations. "
+            "Keep it under 3 sentences. "
+            f"Context: {' '.join(context_parts)}"
+        )
+
+        try:
+            data = self._call_foundry(prompt)
+            text = self._extract_plain_text(data).strip()
+            return text or f"Good day {team}. We will begin shortly."
+        except Exception:
+            logging.exception("create_support_greeting failed, using fallback")
+            return f"Good day {team}. We will begin shortly."
+    
+
     def summarize_issue_for_standup(self, issue: Dict[str, Any]) -> str:
         if not issue:
             return "No summary provided"
@@ -76,6 +117,7 @@ class AgentClient:
         except Exception:
             logging.exception("Agent summarize_issue_for_standup failed for issue=%s", issue.get("key"))
             return str(issue.get("summary") or "No summary provided")
+
 
     def get_issue_transitions(self, issue_key: str) -> List[Dict[str, Any]]:
         if not issue_key or not self._is_foundry_configured():

@@ -5,6 +5,8 @@ import time
 from typing import Any, Dict, List, Optional
 
 import redis
+from dotenv import load_dotenv
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +97,7 @@ class StateStore:
         payload = json.dumps(state)
         try:
             self.client.set(key, payload, ex=self.ttl)
-            logger.info("SAVE state key=%s size=%s ttl=%s", key, len(payload), self.ttl)
+            logger.info("SAVE state key=%s payload=%s ttl=%s", key, payload, self.ttl)
             return state
         except Exception:
             logger.exception("SAVE failed key=%s", key)

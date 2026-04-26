@@ -10,7 +10,8 @@ import azure.functions as func
 
 from orchestrator import Orchestrator
 from state_store import StateStore
-
+from dotenv import load_dotenv
+load_dotenv()
 
 def _configure_logging() -> None:
     level_name = os.getenv("LOG_LEVEL", "INFO").upper()
