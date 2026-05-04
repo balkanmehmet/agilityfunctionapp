@@ -43,11 +43,14 @@ _store: Optional[StateStore] = None
 BOT_SPEAKER_NAME = os.getenv("RECALL_BOT_NAME").strip().lower()
 MIN_TRANSCRIPT_LENGTH = int(os.getenv("RECALL_MIN_TRANSCRIPT_LENGTH", "6"))
 SILENCE_TIMEOUT_SECONDS = float(os.getenv("STANDUP_SILENCE_TIMEOUT_SECONDS", "3"))
-NO_RESPONSE_TIMEOUT_SECONDS = float(os.getenv("STANDUP_NO_RESPONSE_TIMEOUT_SECONDS", "15"))
+NO_RESPONSE_TIMEOUT_SECONDS = float(os.getenv("STANDUP_NO_RESPONSE_TIMEOUT_SECONDS", "35"))
 EARLY_FINALIZE_SECONDS = float(os.getenv("STANDUP_EARLY_FINALIZE_SECONDS", "1.0"))
+WATCHER_LOCK_TTL_SECONDS = int(os.getenv("STANDUP_WATCHER_LOCK_TTL_SECONDS", "30"))
 _MONITOR_STARTED = False
+_MONITOR_TOKEN = ""
 _WARMED_UP = False
 _WARMUP_LOCK = threading.Lock()
+_MONITOR_LOCK = threading.Lock()
 
 
 END_KEYWORDS = [
@@ -77,7 +80,7 @@ BLOCKER_KEYWORDS = [
     "can't proceed",
     "cannot proceed",
     "need help",
-    "issue with",
+    "jira with",
 ]
 SKIP_KEYWORDS = [
     "skip",
@@ -138,24 +141,25 @@ def health(req: func.HttpRequest) -> func.HttpResponse:
 def _ensure_warm() -> None:
     global _WARMED_UP
     logger.info("_ensure_warm called: warmed_up=%s", _WARMED_UP)
-    if _WARMED_UP:
-        return
-    with _WARMUP_LOCK:
-        if _WARMED_UP:
-            return
-        started_at = time.time()
-        logger.warning("Warmup starting")
-        _get_store()
-        _get_orchestrator()
-        _WARMED_UP = True
-        logger.warning("Warmup completed duration_seconds=%.3f", time.time() - started_at)
+    if not _WARMED_UP:
+        with _WARMUP_LOCK:
+            if not _WARMED_UP:
+                started_at = time.time()
+                logger.warning("Warmup starting")
+                _get_store()
+                _get_orchestrator()
+                _WARMED_UP = True
+                logger.warning("Warmup completed duration_seconds=%.3f", time.time() - started_at)
+
+    # Start the watcher from one shared initializer only. Redis ownership prevents
+    # duplicate watcher loops across Azure Functions worker processes.
+    _ensure_monitor_started()
 
 
 @app.route(route="standup/start", methods=["POST"])
 def standup_start(req: func.HttpRequest) -> func.HttpResponse:
     logger.info("standup_start called")
     _ensure_warm()
-    _ensure_monitor_started()
     try:
         body = req.get_json()
     except ValueError:
@@ -180,10 +184,10 @@ def standup_start(req: func.HttpRequest) -> func.HttpResponse:
     orch = _get_orchestrator()
     state = orch.start_standup(project_key=project_key, meeting_url=meeting_url)
     logger.info(
-        "standup_start completed: instance_id=%s bot_id=%s issues_count=%s",
+        "standup_start completed: instance_id=%s bot_id=%s jiras_count=%s",
         state.get("instance_id"),
         state.get("bot_id"),
-        len(state.get("issues", []) or []),
+        len(state.get("jiras", []) or []),
     )
     return func.HttpResponse(json.dumps(state), mimetype="application/json", status_code=200)
 
@@ -200,7 +204,7 @@ def standup_state(req: func.HttpRequest) -> func.HttpResponse:
 @app.route(route="recall/webhook", methods=["POST"])
 def recall_webhook(req: func.HttpRequest) -> func.HttpResponse:
     logger.info("recall_webhook called")
-    _ensure_monitor_started()
+    _ensure_warm()
     try:
         body: Dict[str, Any] = req.get_json()
     except ValueError:
@@ -243,13 +247,30 @@ def recall_webhook(req: func.HttpRequest) -> func.HttpResponse:
         return _handle_speech_event(event_name=event_name, bot_id=bot_id, body=body)
 
     store = _get_store()
+
     participant = inner_data.get("participant", {}) if isinstance(inner_data, dict) else {}
     transcript_speaker_name = str(participant.get("name") or "Unknown")
 
+    instance_id = store.get_instance_id_by_bot_id(bot_id)
+    logger.info("Transcript mapping: bot_id=%s -> instance_id=%s", bot_id, instance_id)
+
+    if instance_id:
+        state = store.get_state(instance_id)
+        if state and state.get("status") == "completed":
+            logger.info(
+                "Ignoring transcript for completed standup: instance_id=%s speaker=%s event=%s",
+                instance_id,
+                transcript_speaker_name,
+                event_name,
+            )
+            return func.HttpResponse(
+                json.dumps({"status": "ignored", "reason": "standup_completed", "instance_id": instance_id}),
+                mimetype="application/json",
+                status_code=200,
+            )
+
     # Clear stale bot-speaking state as soon as human transcript traffic arrives.
     if transcript_speaker_name.strip().lower() != BOT_SPEAKER_NAME:
-        instance_id = store.get_instance_id_by_bot_id(bot_id)
-        logger.info("Transcript mapping: bot_id=%s -> instance_id=%s", bot_id, instance_id)
         if instance_id:
             state = store.get_state(instance_id)
             if state.get("is_bot_speaking"):
@@ -296,8 +317,6 @@ def recall_webhook(req: func.HttpRequest) -> func.HttpResponse:
             status_code=200,
         )
 
-    instance_id = store.get_instance_id_by_bot_id(bot_id)
-    logger.info("Webhook mapping: bot_id=%s -> instance_id=%s", bot_id, instance_id)
     if not instance_id:
         logger.warning("bot mapping not found for bot_id=%s", bot_id)
         return func.HttpResponse(
@@ -306,7 +325,6 @@ def recall_webhook(req: func.HttpRequest) -> func.HttpResponse:
             status_code=200,
         )
 
-    store = _get_store()
     state = store.get_state(instance_id)
     reply_state = state.get("reply_state", {})
     logger.info(
@@ -511,7 +529,21 @@ def _handle_speech_event(event_name: str, bot_id: str, body: Dict[str, Any]) -> 
         speaker_name,
         speaker_is_bot,
     )
-
+    
+    current_state = store.get_state(instance_id)
+    if current_state and current_state.get("status") == "completed":
+        logger.info(
+            "Ignoring speech event for completed standup: instance_id=%s event=%s speaker=%s",
+            instance_id,
+            event_name,
+            speaker_name,
+        )
+        return func.HttpResponse(
+            json.dumps({"status": "ignored", "reason": "standup_completed", "instance_id": instance_id}),
+            mimetype="application/json",
+            status_code=200,
+        )
+    
     if speaker_is_bot:
         if event_name == "participant_events.speech_on":
             logger.info("Bot speech started: instance_id=%s", instance_id)
@@ -580,32 +612,65 @@ def _handle_speech_event(event_name: str, bot_id: str, body: Dict[str, Any]) -> 
 
 
 def _ensure_monitor_started() -> None:
-    global _MONITOR_STARTED
+    global _MONITOR_STARTED, _MONITOR_TOKEN
     logger.info("_ensure_monitor_started called: monitor_started=%s", _MONITOR_STARTED)
     if _MONITOR_STARTED:
         return
-    thread = threading.Thread(target=_reply_monitor_loop, name="standup-reply-monitor", daemon=True)
-    thread.start()
-    _MONITOR_STARTED = True
-    logger.info("Standup reply monitor thread started")
+
+    with _MONITOR_LOCK:
+        if _MONITOR_STARTED:
+            return
+
+        store = _get_store()
+        token = store.acquire_lock("reply_watcher_owner", "global", ttl_seconds=WATCHER_LOCK_TTL_SECONDS)
+        if not token:
+            logger.info("Standup reply watcher already owned by another worker")
+            return
+
+        _MONITOR_TOKEN = token
+        thread = threading.Thread(
+            target=_reply_monitor_loop,
+            args=(token,),
+            name="standup-reply-watcher",
+            daemon=True,
+        )
+        thread.start()
+        _MONITOR_STARTED = True
+        logger.warning("Standup reply watcher thread started with Redis ownership")
 
 
-def _reply_monitor_loop() -> None:
-    logger.info(
-        "Standup reply monitor started: silence_timeout=%s no_response_timeout=%s early_finalize=%s",
+def _reply_monitor_loop(owner_token: str) -> None:
+    global _MONITOR_STARTED, _MONITOR_TOKEN
+    logger.warning(
+        "Standup reply watcher started: silence_timeout=%s no_response_timeout=%s early_finalize=%s lock_ttl=%s",
         SILENCE_TIMEOUT_SECONDS,
         NO_RESPONSE_TIMEOUT_SECONDS,
         EARLY_FINALIZE_SECONDS,
+        WATCHER_LOCK_TTL_SECONDS,
     )
+
+    store = _get_store()
+    orch = _get_orchestrator()
+
     while True:
         try:
+            renewed = store.renew_lock(
+                "reply_watcher_owner",
+                "global",
+                owner_token,
+                ttl_seconds=WATCHER_LOCK_TTL_SECONDS,
+            )
+            if not renewed:
+                logger.warning("Standup reply watcher lost Redis ownership; exiting")
+                _MONITOR_STARTED = False
+                _MONITOR_TOKEN = ""
+                return
+
             now = time.time()
-            _ensure_warm()
-            store = _get_store()
-            orch = _get_orchestrator()
             activated = store.activate_ready_reply_windows(now=now)
             if activated:
                 logger.info("Activated reply windows for instances=%s", activated)
+
             for item in store.list_active_reply_windows():
                 instance_id = item["instance_id"]
                 reply_state = item.get("reply_state", {})
@@ -620,7 +685,16 @@ def _reply_monitor_loop() -> None:
 
                 should_finalize = False
                 if finalize_after_ts is not None and now >= float(finalize_after_ts):
-                    should_finalize = True
+                    current_state = store.get_state(instance_id)
+                    if current_state:
+                        current_reply_state = current_state.get("reply_state") or {}
+                        if current_reply_state.get("finalize_after_ts") is not None:
+                            current_reply_state["finalize_after_ts"] = None
+                            current_state["reply_state"] = current_reply_state
+                            store.save_state(instance_id, current_state)
+                            should_finalize = True
+                        else:
+                            continue
                 elif combined_text and now - last_activity_ts >= SILENCE_TIMEOUT_SECONDS:
                     should_finalize = True
                 elif not combined_text and now - reply_window_started_ts >= NO_RESPONSE_TIMEOUT_SECONDS:
@@ -636,9 +710,15 @@ def _reply_monitor_loop() -> None:
                 if should_finalize:
                     logger.info("Finalizing buffered reply for instance_id=%s", instance_id)
                     orch.finalize_buffered_reply(instance_id)
+
         except Exception:
-            logger.exception("Standup reply monitor loop error")
-        time.sleep(0.5)
+            logger.exception("Standup reply watcher loop error")
+        finally:
+            time.sleep(0.5)
+
+    # Unreachable in normal operation, but retained for clarity.
+    _MONITOR_STARTED = False
+    _MONITOR_TOKEN = ""
 
 
 def _get_orchestrator() -> Orchestrator:

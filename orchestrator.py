@@ -44,12 +44,12 @@ class Orchestrator:
         instance_id = str(uuid.uuid4())
         logger.info("Generated standup instance_id=%s", instance_id)
 
-        issues = self.agent.get_active_issues(project_key=project_key)
-        standup_issues = self._build_standup_issue_queue(issues)
+        jiras = self.agent.get_active_jiras(project_key=project_key)
+        standup_jiras = self._build_standup_jira_queue(jiras)
         logger.info(
-            "Retrieved project issues: total_count=%s standup_queue_count=%s project_key=%s",
-            len(issues),
-            len(standup_issues),
+            "Retrieved project jiras: total_count=%s standup_queue_count=%s project_key=%s",
+            len(jiras),
+            len(standup_jiras),
             project_key,
         )
 
@@ -71,22 +71,22 @@ class Orchestrator:
             logger.info("Starting dashboard webpage output: bot_id=%s dashboard_url=%s instance_id=%s", bot_id, self.dashboard_url, instance_id)
             self.recall.start_webpage_output(bot_id, self.dashboard_url, instance_id)
 
-        current_issue = standup_issues[0] if standup_issues else None
+        current_jira = standup_jiras[0] if standup_jiras else None
         state: Dict[str, Any] = {
             "instance_id": instance_id,
             "project_key": project_key,
             "meeting_url": meeting_url,
             "bot_id": bot_id,
-            "issues": issues,
-            "standup_issues": standup_issues,
+            "jiras": jiras,
+            "standup_jiras": standup_jiras,
             "current_index": 0,
-            "current_issue": current_issue,
-            "completed_issues": [],
+            "current_jira": current_jira,
+            "completed_jiras": [],
             "replies": [],
             "spoken_events": [],
-            "status": "waiting_for_update" if current_issue else "completed",
-            "dashboard_issue_count": len(issues),
-            "standup_issue_count": len(standup_issues),
+            "status": "waiting_for_update" if current_jira else "completed",
+            "dashboard_jira_count": len(jiras),
+            "standup_jira_count": len(standup_jiras),
             "reply_state": {},
             "is_bot_speaking": False,
             "last_advance_ts": 0.0,
@@ -96,10 +96,10 @@ class Orchestrator:
 
         self.store.save_state(instance_id, state)
         logger.info(
-            "Initial standup state saved: instance_id=%s current_issue=%s issues_count=%s",
+            "Initial standup state saved: instance_id=%s current_jira=%s jiras_count=%s",
             instance_id,
-            (current_issue or {}).get("key") if current_issue else None,
-            len(issues),
+            (current_jira or {}).get("key") if current_jira else None,
+            len(jiras),
         )
 
         greeting = self.agent.create_support_greeting(
@@ -107,7 +107,7 @@ class Orchestrator:
             include_dashboard_notice=bool(self.dashboard_url),
             include_mute_reminder=False,
         )
-        logger.info("Sending standup greeting before issue review: instance_id=%s", instance_id)
+        logger.info("Sending standup greeting before jira review: instance_id=%s", instance_id)
         state["status"] = "initializing"
         self.store.save_state(instance_id, state)
         state = self._speak_and_record(instance_id=instance_id, state=state, text=greeting, stage="greeting")
@@ -120,11 +120,11 @@ class Orchestrator:
             )
             time.sleep(self.dashboard_display_delay_seconds)
 
-        if current_issue:
-            intro = self.agent.create_issue_intro(current_issue, position=1, total=len(standup_issues))
-            state = self._speak_and_record(instance_id=instance_id, state=state, text=intro, stage="issue_intro")
+        if current_jira:
+            intro = self.agent.create_jira_intro(current_jira, position=1, total=len(standup_jiras))
+            state = self._speak_and_record(instance_id=instance_id, state=state, text=intro, stage="jira_intro")
         else:
-            logger.warning("No active issues returned; sending closing message immediately")
+            logger.warning("No active jiras returned; sending closing message immediately")
             closing = self.agent.create_closing_text(processed_count=0)
             state = self._speak_and_record(instance_id=instance_id, state=state, text=closing, stage="closing")
 
@@ -149,31 +149,31 @@ class Orchestrator:
             logger.warning("save_reply missing state for instance_id=%s", instance_id)
             raise ValueError(f"Unknown standup instance_id: {instance_id}")
 
-        current_issue = state.get("current_issue") or {}
+        current_jira = state.get("current_jira") or {}
         reply = {
-            "issue_key": current_issue.get("key"),
+            "jira_key": current_jira.get("key"),
             "speaker_name": speaker_name,
             "text": text,
             "intent": intent,
         }
-        transition_result = self._maybe_update_issue_status(current_issue=current_issue, text=text, intent=intent)
+        transition_result = self._maybe_update_jira_status(current_jira=current_jira, text=text, intent=intent)
         if transition_result:
             reply["jira_transition"] = transition_result
             if transition_result.get("ok") and transition_result.get("new_status"):
                 new_status = transition_result["new_status"]
-                current_issue["status"] = new_status
-                for issue in state.get("issues", []):
-                    if issue.get("key") == current_issue.get("key"):
-                        issue["status"] = new_status
-                for issue in state.get("standup_issues", []):
-                    if issue.get("key") == current_issue.get("key"):
-                        issue["status"] = new_status
-                state["current_issue"] = current_issue
-                logger.info("Updated current issue status from reply: issue_key=%s new_status=%s", current_issue.get("key"), new_status)
+                current_jira["status"] = new_status
+                for jira in state.get("jiras", []):
+                    if jira.get("key") == current_jira.get("key"):
+                        jira["status"] = new_status
+                for jira in state.get("standup_jiras", []):
+                    if jira.get("key") == current_jira.get("key"):
+                        jira["status"] = new_status
+                state["current_jira"] = current_jira
+                logger.info("Updated current jira status from reply: jira_key=%s new_status=%s", current_jira.get("key"), new_status)
             elif not transition_result.get("ok"):
                 logger.warning(
-                    "Jira transition failed for issue_key=%s message=%s",
-                    current_issue.get("key"),
+                    "Jira transition failed for jira_key=%s message=%s",
+                    current_jira.get("key"),
                     transition_result.get("message"),
                 )
 
@@ -184,7 +184,7 @@ class Orchestrator:
         state["status"] = "reply_received"
         self.store.save_state(instance_id, state)
         self.store.clear_reply_window(instance_id)
-        logger.info("Reply saved: instance_id=%s issue_key=%s total_replies=%s", instance_id, current_issue.get("key"), len(replies))
+        logger.info("Reply saved: instance_id=%s jira_key=%s total_replies=%s", instance_id, current_jira.get("key"), len(replies))
         return state
 
     def advance(self, instance_id: str) -> Dict[str, Any]:
@@ -194,42 +194,42 @@ class Orchestrator:
             logger.warning("advance missing state for instance_id=%s", instance_id)
             raise ValueError(f"Unknown standup instance_id: {instance_id}")
 
-        issues: List[Dict[str, Any]] = state.get("issues", [])
-        standup_issues: List[Dict[str, Any]] = state.get("standup_issues", [])
+        jiras: List[Dict[str, Any]] = state.get("jiras", [])
+        standup_jiras: List[Dict[str, Any]] = state.get("standup_jiras", [])
         current_index = int(state.get("current_index", 0))
-        current_issue = state.get("current_issue")
+        current_jira = state.get("current_jira")
 
-        if current_issue:
-            completed = state.get("completed_issues", [])
-            if not any(item.get("key") == current_issue.get("key") for item in completed):
-                completed.append(current_issue)
-                state["completed_issues"] = completed
-                logger.info("Marked issue completed in standup flow: instance_id=%s issue_key=%s", instance_id, current_issue.get("key"))
+        if current_jira:
+            completed = state.get("completed_jiras", [])
+            if not any(item.get("key") == current_jira.get("key") for item in completed):
+                completed.append(current_jira)
+                state["completed_jiras"] = completed
+                logger.info("Marked jira completed in standup flow: instance_id=%s jira_key=%s", instance_id, current_jira.get("key"))
 
         next_index = current_index + 1
-        if next_index >= len(standup_issues):
-            state["current_index"] = len(standup_issues)
-            state["current_issue"] = None
+        if next_index >= len(standup_jiras):
+            state["current_index"] = len(standup_jiras)
+            state["current_jira"] = None
             state["status"] = "completed"
             self.store.save_state(instance_id, state)
-            logger.info("advance reached end of issue list: instance_id=%s completed_count=%s", instance_id, len(state.get("completed_issues", [])))
-            closing = self.agent.create_closing_text(processed_count=len(state.get("completed_issues", [])))
+            logger.info("advance reached end of jira list: instance_id=%s completed_count=%s", instance_id, len(state.get("completed_jiras", [])))
+            closing = self.agent.create_closing_text(processed_count=len(state.get("completed_jiras", [])))
             state = self._speak_and_record(instance_id=instance_id, state=state, text=closing, stage="closing")
             return state
 
-        next_issue = standup_issues[next_index]
+        next_jira = standup_jiras[next_index]
         state["current_index"] = next_index
-        state["current_issue"] = next_issue
+        state["current_jira"] = next_jira
         state["status"] = "waiting_for_update"
         self.store.save_state(instance_id, state)
-        logger.info("Advanced to next issue: instance_id=%s next_index=%s issue_key=%s", instance_id, next_index, next_issue.get("key"))
+        logger.info("Advanced to next jira: instance_id=%s next_index=%s jira_key=%s", instance_id, next_index, next_jira.get("key"))
 
         transition = self.agent.create_transition_text(
-            next_issue,
+            next_jira,
             position=next_index + 1,
-            total=len(standup_issues),
+            total=len(standup_jiras),
         )
-        state = self._speak_and_record(instance_id=instance_id, state=state, text=transition, stage="issue_intro")
+        state = self._speak_and_record(instance_id=instance_id, state=state, text=transition, stage="jira_intro")
         return state
 
     def _mark_advance_if_allowed(self, instance_id: str) -> Optional[Dict[str, Any]]:
@@ -293,18 +293,22 @@ class Orchestrator:
         saved_state = self.save_reply(instance_id=instance_id, speaker_name=speaker_name, text=text, intent=intent)
         last_reply = saved_state.get("last_reply") or {}
         transition_result = last_reply.get("jira_transition") or {}
+        current_index = int(saved_state.get("current_index", 0))
+        standup_jiras = saved_state.get("standup_jiras", [])
+        is_last_jira = current_index >= len(standup_jiras) - 1
         if transition_result.get("ok"):
-            narration = self._build_transition_narration(
-                issue_key=str(last_reply.get("issue_key") or "").strip(),
+            narration = self.agent.build_transition_narration(
+                jira_key=str(last_reply.get("jira_key") or "").strip(),
                 old_status=str(transition_result.get("old_status") or "").strip(),
                 new_status=str(transition_result.get("new_status") or "").strip(),
                 already_in_target=bool(transition_result.get("already_in_target")),
+                is_last_jira=is_last_jira,
             )
             if narration:
                 logger.info(
-                    "Narrating Jira status change: instance_id=%s issue_key=%s narration=%s",
+                    "Narrating Jira status change: instance_id=%s jira_key=%s narration=%s",
                     instance_id,
-                    last_reply.get("issue_key"),
+                    last_reply.get("jira_key"),
                     narration,
                 )
                 self._speak_and_record(instance_id=instance_id, state=saved_state, text=narration, stage="transition_update")
@@ -315,7 +319,30 @@ class Orchestrator:
                     transition_pause_seconds,
                 )
                 time.sleep(transition_pause_seconds)
+        else:
+            narration = self.agent.build_acknowledgement_narration(
+                jira_key=str(last_reply.get("jira_key") or "").strip(),
+                is_last_jira=is_last_jira,
+            )
+            if narration:
+                logger.info(
+                    "Narrating acknowledgement (no transition): instance_id=%s jira_key=%s narration=%s",
+                    instance_id,
+                    last_reply.get("jira_key"),
+                    narration,
+                )
+                self._speak_and_record(instance_id=instance_id, state=saved_state, text=narration, stage="transition_update")
+                transition_pause_seconds = max(1.5, min(6.0, len(narration.split()) / 2.2))
+                logger.info(
+                    "Waiting for acknowledgement playback before advance: instance_id=%s pause_seconds=%s",
+                    instance_id,
+                    transition_pause_seconds,
+                )
+                time.sleep(transition_pause_seconds)
+        self.store.clear_reply_window(instance_id)
+        time.sleep(1.5)
         return self.advance(instance_id=instance_id)
+        
 
     def finalize_buffered_reply(self, instance_id: str) -> Optional[Dict[str, Any]]:
         logger.info("finalize_buffered_reply called: instance_id=%s", instance_id)
@@ -341,10 +368,10 @@ class Orchestrator:
 
 
     @staticmethod
-    def _build_standup_issue_queue(issues: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _build_standup_jira_queue(jiras: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         allowed_statuses = {"Blocked", "In Progress"}
-        queue = [issue for issue in issues if str(issue.get("status") or "") in allowed_statuses]
-        logger.info("Built standup issue queue: total_issues=%s queue_count=%s", len(issues), len(queue))
+        queue = [jira for jira in jiras if str(jira.get("status") or "") in allowed_statuses]
+        logger.info("Built standup jira queue: total_jiras=%s queue_count=%s", len(jiras), len(queue))
         return queue
 
     def _speak_and_record(self, instance_id: str, state: Dict[str, Any], text: str, stage: str) -> Dict[str, Any]:
@@ -355,7 +382,7 @@ class Orchestrator:
         spoken_events.append(
             {
                 "stage": stage,
-                "issue_key": (state.get("current_issue") or {}).get("key"),
+                "jira_key": (state.get("current_jira") or {}).get("key"),
                 "text": text,
             }
         )
@@ -374,6 +401,7 @@ class Orchestrator:
             self.recall.send_audio_mp3(bot_id, audio)
             logger.info("Audio sent to Recall bot: instance_id=%s bot_id=%s stage=%s", instance_id, bot_id, stage)
             if stage not in {"closing", "transition_update"}:
+                self.store.clear_reply_window(instance_id) 
                 state = self.store.set_bot_speaking(instance_id, True, started_at=time.time())
                 expected_duration_seconds = max(2.0, min(20.0, len(text.split()) / 2.2))
                 open_at = time.time() + expected_duration_seconds
@@ -395,77 +423,63 @@ class Orchestrator:
             self.store.save_state(instance_id, state)
         return self.store.get_state(instance_id)
 
-    @staticmethod
-    def _build_transition_narration(issue_key: str, old_status: str, new_status: str, already_in_target: bool = False) -> str:
-        issue_key = (issue_key or "").strip()
-        old_status = (old_status or "").strip()
-        new_status = (new_status or "").strip()
-        if not issue_key:
-            return ""
-        if already_in_target and new_status:
-            return f"{issue_key} remains in {new_status}. Moving on to next jira."
-        if old_status and new_status and old_status.lower() != new_status.lower():
-            return f"Got it. Moving {issue_key} from {old_status} to {new_status}. Moving on to next jira."
-        if new_status:
-            return f"Got it. Updating {issue_key} to {new_status}. Moving on to next jira."
-        return ""
 
-    def _maybe_update_issue_status(self, current_issue: Dict[str, Any], text: str, intent: str) -> Optional[Dict[str, Any]]:
-        issue_key = str((current_issue or {}).get("key") or "").strip()
-        logger.info("_maybe_update_issue_status called: issue_key=%s intent=%s text_len=%s", issue_key, intent, len(text or ""))
-        if not issue_key:
-            logger.warning("_maybe_update_issue_status skipped because issue key is missing")
+    def _maybe_update_jira_status(self, current_jira: Dict[str, Any], text: str, intent: str) -> Optional[Dict[str, Any]]:
+        jira_key = str((current_jira or {}).get("key") or "").strip()
+        logger.info("_maybe_update_jira_status called: jira_key=%s intent=%s text_len=%s", jira_key, intent, len(text or ""))
+        if not jira_key:
+            logger.warning("_maybe_update_jira_status skipped because jira key is missing")
             return None
 
         target_candidates = self._get_transition_candidates(text=text, intent=intent)
         if not target_candidates:
-            logger.info("No transition candidates inferred for issue_key=%s", issue_key)
+            logger.info("No transition candidates inferred for jira_key=%s", jira_key)
             return None
 
-        current_status = str((current_issue or {}).get("status") or "").strip().lower()
+        current_status = str((current_jira or {}).get("status") or "").strip().lower()
         if any(current_status == candidate.lower() for candidate in target_candidates):
-            logger.info("Issue already in target status: issue_key=%s current_status=%s", issue_key, current_issue.get("status", ""))
+            logger.info("jira already in target status: jira_key=%s current_status=%s", jira_key, current_jira.get("status", ""))
             return {
                 "ok": True,
-                "issue_key": issue_key,
-                "old_status": current_issue.get("status", ""),
-                "transition_applied": current_issue.get("status", ""),
-                "new_status": current_issue.get("status", ""),
-                "message": "Issue already in target status.",
+                "jira_key": jira_key,
+                "old_status": current_jira.get("status", ""),
+                "transition_applied": current_jira.get("status", ""),
+                "new_status": current_jira.get("status", ""),
+                "message": "jira already in target status.",
                 "already_in_target": True,
             }
 
-        transitions = self.agent.get_issue_transitions(issue_key)
+        transitions = self.agent.get_jira_transitions(jira_key)
         if not transitions:
-            logger.warning("No valid Jira transitions returned for issue_key=%s", issue_key)
+            logger.warning("No valid Jira transitions returned for jira_key=%s", jira_key)
             return {
                 "ok": False,
-                "issue_key": issue_key,
+                "jira_key": jira_key,
                 "message": "No valid Jira transitions returned.",
             }
 
         selected = self._select_transition(transitions, target_candidates)
         if not selected:
-            logger.warning("No matching Jira transition found for issue_key=%s candidates=%s", issue_key, target_candidates)
+            logger.warning("No matching Jira transition found for jira_key=%s candidates=%s", jira_key, target_candidates)
             return {
                 "ok": False,
-                "issue_key": issue_key,
+                "jira_key": jira_key,
                 "message": f"No matching Jira transition found for candidates: {target_candidates}",
                 "available_transitions": transitions,
             }
 
-        result = self.agent.update_issue_status(
-            issue_key,
+        result = self.agent.update_jira_status(
+            jira_key,
             transition_id=selected.get("id") or None,
             transition_name=selected.get("name") or None,
         )
         result["target_candidates"] = target_candidates
         result["selected_transition"] = selected
-        result["old_status"] = current_issue.get("status", "")
+        result["old_status"] = current_jira.get("status", "")
         result["new_status"] = result.get("new_status") or selected.get("to_status") or selected.get("name") or result.get("transition_applied") or ""
         logger.info(
-            "Jira status update attempted: issue_key=%s selected_transition=%s ok=%s",
-            issue_key,
+            "Jira status update attempted: jira_key=%s selected_transition=%s ok=%s",
+            jira_key,
             selected,
             result.get("ok"),
         )

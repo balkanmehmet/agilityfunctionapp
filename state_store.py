@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from typing import Any, Dict, List, Optional
 
 import redis
@@ -78,6 +79,46 @@ class StateStore:
     def _bot_map_key(self, bot_id: str) -> str:
         return f"{self.prefix}botmap:{bot_id}"
 
+    def _lock_key(self, name: str, instance_id: str) -> str:
+        return f"{self.prefix}lock:{name}:{instance_id}"
+
+    def acquire_lock(self, name: str, instance_id: str, ttl_seconds: int = 30) -> str:
+        token = str(uuid.uuid4())
+        key = self._lock_key(name, instance_id)
+        try:
+            acquired = self.client.set(key, token, nx=True, ex=ttl_seconds)
+            logger.info("LOCK acquire name=%s instance_id=%s acquired=%s", name, instance_id, bool(acquired))
+            return token if acquired else ""
+        except Exception:
+            logger.exception("LOCK acquire failed name=%s instance_id=%s", name, instance_id)
+            return ""
+
+    def renew_lock(self, name: str, instance_id: str, token: str, ttl_seconds: int = 30) -> bool:
+        key = self._lock_key(name, instance_id)
+        try:
+            current = self.client.get(key)
+            if current != token:
+                logger.warning("LOCK renew lost name=%s instance_id=%s", name, instance_id)
+                return False
+            renewed = self.client.expire(key, ttl_seconds)
+            logger.info("LOCK renew name=%s instance_id=%s renewed=%s", name, instance_id, bool(renewed))
+            return bool(renewed)
+        except Exception:
+            logger.exception("LOCK renew failed name=%s instance_id=%s", name, instance_id)
+            return False
+
+    def release_lock(self, name: str, instance_id: str, token: str) -> None:
+        key = self._lock_key(name, instance_id)
+        try:
+            current = self.client.get(key)
+            if current == token:
+                released = self.client.delete(key)
+                logger.info("LOCK released name=%s instance_id=%s released=%s", name, instance_id, released)
+            else:
+                logger.info("LOCK release skipped name=%s instance_id=%s owner_changed=%s", name, instance_id, bool(current))
+        except Exception:
+            logger.exception("LOCK release failed name=%s instance_id=%s", name, instance_id)
+
     def _state_key_pattern(self) -> str:
         return f"{self.prefix}*"
 
@@ -112,10 +153,10 @@ class StateStore:
                 return {}
             state = self._safe_json_loads(raw)
             logger.info(
-                "READ state key=%s current_issue=%s issues_count=%d status=%s",
+                "READ state key=%s current_jira=%s jiras_count=%d status=%s",
                 key,
-                state.get("current_issue", {}).get("key") if state.get("current_issue") else None,
-                len(state.get("issues", [])),
+                state.get("current_jira", {}).get("key") if state.get("current_jira") else None,
+                len(state.get("jiras", [])),
                 state.get("status")
 )
             return state
@@ -247,7 +288,17 @@ class StateStore:
             if not reply_state.get("pending_bot_completion"):
                 continue
             if state.get("is_bot_speaking"):
-                continue
+                if open_at is not None and float(open_at) <= now:
+                    logger.warning(
+                        "Bot still marked speaking past reply window deadline — "
+                        "clearing stale is_bot_speaking flag: instance_id=%s",
+                        instance_id,
+                    )
+                    state["is_bot_speaking"] = False
+                    state["bot_speaking_ends_at_ts"] = now
+                    self.save_state(instance_id, state)
+                else:
+                    continue  
             if open_at is not None and float(open_at) > now:
                 continue
             self.begin_reply_window(instance_id)
@@ -255,6 +306,7 @@ class StateStore:
         if activated:
             logger.info("ACTIVATE reply windows instances=%s", activated)
         return activated
+
 
     def set_bot_speaking(
         self,
@@ -268,15 +320,30 @@ class StateStore:
         if not state:
             logger.warning("SET bot speaking skipped missing instance_id=%s", instance_id)
             return {}
-        state["is_bot_speaking"] = bool(is_speaking)
-        if started_at is not None:
-            state["bot_speaking_started_ts"] = float(started_at)
-        if ends_at is not None:
-            state["bot_speaking_ends_at_ts"] = float(ends_at)
+
         if is_speaking:
+            state["is_bot_speaking"] = True
+            state["bot_speaking_started_ts"] = float(started_at or time.time())
+            state["bot_speaking_ends_at_ts"] = None
             state["status"] = "bot_speaking"
-        elif state.get("status") != "completed":
-            state["status"] = "waiting_for_update"
+        else:
+            current_started = float(state.get("bot_speaking_started_ts") or 0.0)
+            ends_at_val = float(ends_at or time.time())
+            if ends_at_val < current_started:
+                logger.warning(
+                    "SET bot speaking ignoring stale speech_off: ends_at=%.3f < started_at=%.3f instance_id=%s",
+                    ends_at_val,
+                    current_started,
+                    instance_id,
+                )
+                # Don't touch is_bot_speaking — the current clip is still playing
+                return self.save_state(instance_id, state)
+
+            state["is_bot_speaking"] = False
+            state["bot_speaking_ends_at_ts"] = ends_at_val
+            if state.get("status") != "completed":
+                state["status"] = "waiting_for_update"
+
         logger.info(
             "SET bot speaking instance_id=%s is_speaking=%s started_at=%s ends_at=%s",
             instance_id,
@@ -399,7 +466,7 @@ class StateStore:
         items: List[Dict[str, Any]] = []
         try:
             for key in self.client.scan_iter(match=self._state_key_pattern()):
-                if ":botmap:" in key:
+                if ":botmap:" in key or ":lock:" in key:
                     continue
                 instance_id = key.replace(self.prefix, "", 1)
                 raw = self.client.get(key)
